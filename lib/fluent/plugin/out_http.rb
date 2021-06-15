@@ -1,4 +1,5 @@
 require 'net/http'
+require 'net/http/persistent'
 require 'uri'
 require 'yajl'
 require 'fluent/plugin/output'
@@ -12,6 +13,7 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
   class RecoverableResponse < StandardError; end
 
   helpers :compat_parameters, :formatter
+  attr_accessor :http_client
 
   DEFAULT_BUFFER_TYPE = "memory"
   DEFAULT_FORMATTER = "json"
@@ -84,7 +86,7 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
     @ssl_verify_mode = if @ssl_no_verify
                          OpenSSL::SSL::VERIFY_NONE
                        else
-                         OpenSSL::SSL::VERIFY_PEER
+                         false
                        end
 
     @ca_file = @cacert_file
@@ -106,6 +108,11 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
         alias_method :format, :split_request_format
       end
     end
+
+    url = format_url
+    uri = URI.parse(url)
+    @http_client = Net::HTTP::Persistent.new
+    http_opts(uri).each {|key, val| puts key; puts val; @http_client.send("#{key}=", val) if val }
   end
 
   def start
@@ -116,7 +123,7 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
     super
   end
 
-  def format_url(tag, time, record)
+  def format_url(tag = nil, time = nil, record = nil)
     @endpoint_url
   end
 
@@ -189,14 +196,13 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
   end
 
   def http_opts(uri)
-      opts = {
-        :use_ssl => uri.scheme == 'https'
-      }
-      opts[:verify_mode] = @ssl_verify_mode if opts[:use_ssl]
-      opts[:ca_file] = File.join(@ca_file) if File.file?(@ca_file)
-      opts[:cert] = OpenSSL::X509::Certificate.new(File.read(@client_cert_path)) if File.file?(@client_cert_path)
-      opts[:key] = OpenSSL::PKey.read(File.read(@private_key_path), @private_key_passphrase) if File.file?(@private_key_path)
-      opts
+    use_ssl = uri.scheme == 'https'
+    opts = {}
+    opts[:verify_mode] = @ssl_verify_mode if use_ssl
+    opts[:ca_file] = File.join(@ca_file) if File.file?(@ca_file)
+    opts[:cert] = OpenSSL::X509::Certificate.new(File.read(@client_cert_path)) if File.file?(@client_cert_path)
+    opts[:key] = OpenSSL::PKey.read(File.read(@private_key_path), @private_key_passphrase) if File.file?(@private_key_path)
+    opts
   end
 
   def proxies
@@ -213,24 +219,16 @@ class Fluent::Plugin::HTTPOutput < Fluent::Plugin::Output
     res = nil
 
     begin
-      if @authentication == :basic
-        req.basic_auth(@username, @password)
-      elsif @authentication == :bearer
-        req['authorization'] = "bearer #{@token}"
-      elsif @authentication == :jwt
-        req['authorization'] = "jwt #{@token}"
-      end
+      # if @authentication == :basic
+      #   req.basic_auth(@username, @password)
+      # elsif @authentication == :bearer
+      #   req['authorization'] = "bearer #{@token}"
+      # elsif @authentication == :jwt
+      #   req['authorization'] = "jwt #{@token}"
+      # end
       @last_request_time = Time.now.to_f
 
-      if proxy = proxies
-        proxy_uri = URI.parse(proxy)
-
-        res = Net::HTTP.start(uri.host, uri.port,
-                              proxy_uri.host, proxy_uri.port, proxy_uri.user, proxy_uri.password,
-                              **http_opts(uri)) {|http| http.request(req) }
-      else
-        res = Net::HTTP.start(uri.host, uri.port, **http_opts(uri)) {|http| http.request(req) }
-      end
+      res = @http_client.request(uri, req)
 
     rescue => e # rescue all StandardErrors
       # server didn't respond
